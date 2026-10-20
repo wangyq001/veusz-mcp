@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+runtime/
+.venv/
+output/
+translations/*.qm
+veusz.local.json
+.env
+.env.*
+!.env.example
+.pytest_cache/
+.coverage
+build/
+dist/
+*.egg-info/
