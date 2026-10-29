@@ -4,12 +4,11 @@
 
 图形由 Veusz 的数据集、曲线、坐标轴、图例和文本对象组成，保存为可编辑的 `.vsz` 工程。绘图通过文档 API 完成，不依赖鼠标点击、屏幕坐标或整图截图替代。
 
-> 当前为 v0.1，主要验证环境是 Windows 10、Veusz 4.2.1 和 Codex。不是 Veusz 官方项目。
+> 当前为 v0.2，主要验证环境是 Windows 10、Veusz 4.2.1 和 Codex。不是 Veusz 官方项目。
 
-![模拟数据示例](docs/images/robustness-demo.png)
+![Veusz MCP native 3D plotting demo](docs/images/veusz-native-3d-demo.png)
 
-上图由本项目控制 Veusz 绘制：三种模拟方法、七档噪声、每档五次重复；误差棒表示标准差。它只用于功能演示，不是研究结论。示例数据见 [examples/simulated_robustness.csv](examples/simulated_robustness.csv)。
-
+上图展示 MCP 在 Veusz 原生编辑器中创建的可编辑三维合成地形；左侧为交互界面，右侧为 Veusz 完整编辑器。图中数据为合成示例。
 ## 可以做什么
 
 - 导入数值 CSV/TSV，创建折线、散点和对称误差棒。
@@ -176,15 +175,37 @@ Skill 是**可选的设计指导**，不绑定任何特定 Skill，也不是 MCP
 - 不是“任意绘图脚本自动转 Veusz”的转换器；不支持的效果应明确说明。
 - 不分发第三方 Skill，使用时请自行安装并遵守其许可证。
 
+## 全类型原生图表支持
+
+MCP 从运行中的 Veusz 部件工厂动态发现类型，不维护二维部件白名单。覆盖范围是当前安装版本及已注册插件实际提供的图形；Veusz 自身不支持的效果不在此范围内。
+
+推荐流程：
+
+1. `veusz_status` 检查文档、窗口和版本。
+2. `veusz_widget_catalog` 查询全部类型与父部件要求；指定 `widget_type` 获取递归参数、默认值、可选项和数据维度。父类名可能是 `generic`；指定 `parent_path` 可判断实际父对象是否合法。
+3. `veusz_set_data` 写入 `1d`、`2d`、`nd`、`text`、`datetime` 数据。二维矩阵按行存储，x 对应列、y 对应行；数值 `null` 表示缺测。日期使用 ISO 8601，带时区的输入转换为 UTC。
+4. `veusz_add_widgets` 创建已注册部件，包括三维场景、三维曲面／点线／体数据、等高线、图像、柱形、极坐标、三元图、矢量场、形状和标注等。实际类型以目录为准。`autoadd=false` 关闭默认子部件，新父部件须在批次中排在子部件前。
+5. `veusz_inspect` 查看当前参数和已注册动作；`veusz_apply_changes` 调整原生参数，`veusz_widget_action` 执行拟合等已注册原生动作。
+6. 原生保存、PNG／SVG／PDF 导出及预览继续使用原接口。
+
+数据和部件批次保留单步撤销、冲突检查、失败回滚和手动编辑保护。已有数据须显式 `replace=true`。第三方插件的外部依赖、有效数据条件和 Veusz 自身限制仍然适用；接口覆盖全部注册类型，不代表所有参数组合均已验收。
+
+更新代码后，重新加载 MCP 服务以发现新增工具；已启动的 Veusz 插件需在保存工作后由用户重新启动，智能体不会自动关闭现有窗口。
+
+原生验收：在已连接且无模态提示框的 Veusz 上执行 `python tests/acceptance_native.py`。该脚本通过真实 MCP 测试全部可创建类型的参数发现、创建与撤销，以及五类数据、失败回滚和版本冲突；临时测试内容会撤销。
+
 ## 工具一览
 
 | 工具 | 用途 |
 |---|---|
 | `veusz_status` | 连接、文档版本、桌面身份、数据、对象树、弹窗和渲染状态 |
 | `veusz_inspect` | 查询有效属性路径、设置分组和当前值 |
+| `veusz_widget_catalog` | 动态查询全部已注册部件、父对象要求及递归参数定义 |
+| `veusz_set_data` | 写入一维、二维、多维、文本和日期数据 |
+| `veusz_widget_action` | 执行图形已注册的原生动作，例如拟合 |
 | `veusz_import_data` | 导入数值 CSV/TSV，并记录字段、行数和来源哈希 |
 | `veusz_plot` | 创建折线、散点和对称误差棒 |
-| `veusz_add_widgets` | 添加原生页面、图、坐标轴、曲线、图例和文本 |
+| `veusz_add_widgets` | 添加任意已注册的原生二维／三维部件 |
 | `veusz_apply_changes` | 验证后的局部属性修改 |
 | `veusz_undo` | 撤销最近且未被后续编辑改变的桥接操作 |
 | `veusz_save` | 保存可编辑 `.vsz` 和数据来源清单 |

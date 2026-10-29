@@ -64,7 +64,7 @@ async def main():
                 assert code in str(result.content), str(result.content)
 
             tools = await mcp.list_tools()
-            assert len(tools.tools) == 13
+            assert len(tools.tools) == 16
             passed("official_sdk_stdio_initialization_and_tool_discovery", tools=len(tools.tools))
             s = await state()
             assert s["window_class"] == "MainWindow" and not s["modal"]

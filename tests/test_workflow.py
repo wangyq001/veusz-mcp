@@ -80,7 +80,7 @@ class WorkflowProtocolTests(unittest.IsolatedAsyncioTestCase):
                         initialized = await session.initialize()
                         self.assertIn(veusz_mcp.PLOTTING_GUIDANCE, initialized.instructions)
                         tools = {tool.name: tool for tool in (await session.list_tools()).tools}
-                        self.assertEqual(len(tools), 13)
+                        self.assertEqual(len(tools), 16)
                         for name in ("veusz_status", "veusz_plot", "veusz_add_widgets",
                                      "veusz_apply_changes"):
                             self.assertIn("Skill", tools[name].description)

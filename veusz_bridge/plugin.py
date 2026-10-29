@@ -14,6 +14,8 @@ from veusz.document import operations
 
 from .protocol import BridgeError, Broker, LocalServer, WRITE_METHODS
 from .desktop import desktop_context
+from .native import (widget_catalog, validate_widgets, prepare_datasets,
+                     setting_info, json_value)
 
 
 class AtomicBatch(operations.OperationMultiple):
@@ -170,7 +172,9 @@ class Bridge(qt.QObject):
                 "modified": self.doc.isModified(), "filename": self.doc.filename,
                 "page": self.window.plot.pagenumber, "rendered": self.rendered,
                 "datasets": self.ci.GetDatasets(), "widgets": nodes,
-                "data_summary": {name: {"length": len(ds.data), "dimensions": ds.dimensions}
+                "data_summary": {name: {"length": len(ds.data), "dimensions": ds.dimensions,
+                                        "shape": list(getattr(ds.data, "shape", (len(ds.data),))),
+                                        "datatype": ds.datatype}
                                  for name, ds in self.doc.data.items()},
                 "data_sources": self.sources,
                 "events": self.events[-20:]}
@@ -257,25 +261,29 @@ class Bridge(qt.QObject):
             return self.broker.status(params["request_id"])
         if method == "state":
             return self.state()
+        if method == "widget_catalog":
+            return {**widget_catalog(self.doc, params.get("widget_type"), params.get("parent_path")),
+                    "document_id": self.document_id, "revision": self.revision}
         if method == "get":
             paths = params.get("paths", [])
             if not isinstance(paths, list) or len(paths) > 100:
                 raise BridgeError("BAD_REQUEST", "Provide at most 100 setting paths")
             return {"document_id": self.document_id, "revision": self.revision,
-                    "values": {p: self.ci.Get(p) for p in paths}}
+                    "values": {p: json_value(self.ci.Get(p)) for p in paths}}
         if method == "describe":
             path = params["path"]
             node = self.doc.resolvePath(self.doc.basewidget, path)
+            actions = []
             if node.iswidget:
+                actions = [{"name": a.name, "description": a.descr} for a in node.actions]
                 node = node.settings
             if not node.issettings:
                 raise BridgeError("BAD_REQUEST", "Expected a widget or settings group")
             settings = []
             for child in node.getList():
-                settings.append({"name": child.name, "path": path.rstrip("/") + "/" + child.name,
-                                 "group": child.issettings,
-                                 "value": None if child.issettings else child.val})
-            return {"settings": settings, "revision": self.revision}
+                settings.append(setting_info(child, path.rstrip("/") + "/" + child.name, current=True))
+            return {"settings": settings, "actions": actions,
+                    "document_id": self.document_id, "revision": self.revision}
         if method == "snapshot":
             self.check_write(request)
             path = self.output_path(params.get("path", "output/window.png"))
@@ -313,6 +321,10 @@ class Bridge(qt.QObject):
                 self.create_plot(params)
             elif method == "add_widgets":
                 self.add_widgets(params)
+            elif method == "set_data":
+                self.set_datasets(params)
+            elif method == "widget_action":
+                self.widget_action(params)
             elif method in ("save", "checkpoint"):
                 path = self.save_document(params, checkpoint=method == "checkpoint")
                 return {"path": str(path), "state": self.state()}
@@ -422,22 +434,40 @@ class Bridge(qt.QObject):
 
     def add_widgets(self, params):
         entries = params.get("widgets", [])
-        if not isinstance(entries, list) or not 1 <= len(entries) <= 100:
-            raise BridgeError("BAD_REQUEST", "Provide 1..100 widgets")
-        allowed = {"page", "graph", "axis", "xy", "key", "label"}
-        for entry in entries:
-            if entry.get("type") not in allowed:
-                raise BridgeError("BAD_WIDGET", "Supported widget types: " + ", ".join(sorted(allowed)))
-            if not entry.get("name") or "/" in entry["name"]:
-                raise BridgeError("BAD_WIDGET", "A nonempty widget name without slashes is required")
+        validate_widgets(entries, document.thefactory)
         def action():
             for entry in entries:
                 parent = entry.get("parent", "/")
                 widget = self.doc.resolveWidgetPath(self.doc.basewidget, parent)
                 if entry["name"] in widget.childnames:
                     raise BridgeError("WIDGET_EXISTS", "Widget already exists: " + entry["name"])
-                self.ci.Add(entry["type"], widget=parent, name=entry["name"], **entry.get("settings", {}))
+                cls = document.thefactory.getWidgetClass(entry["type"])
+                if not cls.willAllowParent(widget):
+                    raise BridgeError("BAD_PARENT", "%s cannot be placed under %s" % (entry["type"], widget.typename))
+                self.ci.Add(entry["type"], widget=parent, name=entry["name"],
+                            autoadd=entry.get("autoadd", True), **entry.get("settings", {}))
         self.grouped(action, "Codex: add widgets")
+
+    def set_datasets(self, params):
+        prepared = prepare_datasets(params.get("datasets"))
+        if not params.get("replace", False) and any(name in self.doc.data for name, _, _, _ in prepared):
+            raise BridgeError("DATA_EXISTS", "Dataset already exists; replace must be explicit")
+        def action():
+            for name, kind, data, options in prepared:
+                method = {"1d": self.ci.SetData, "2d": self.ci.SetData2D,
+                          "nd": self.ci.SetDataND, "text": self.ci.SetDataText,
+                          "datetime": self.ci.SetDataDateTime}[kind]
+                method(name, data, **options)
+        self.grouped(action, "Codex: set native datasets")
+
+    def widget_action(self, params):
+        path, action = params.get("path"), params.get("action")
+        if not isinstance(path, str) or not path.startswith("/"):
+            raise BridgeError("BAD_WIDGET", "Widget paths must be absolute")
+        widget = self.doc.resolveWidgetPath(self.doc.basewidget, path)
+        if not isinstance(action, str) or widget.getAction(action) is None:
+            raise BridgeError("BAD_ACTION", "Use a registered action returned by veusz_inspect")
+        self.grouped(lambda: self.ci.Action(action, widget=path), "Codex: widget action")
 
     def create_plot(self, params):
         series = params.get("series", [])

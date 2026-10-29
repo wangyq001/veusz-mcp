@@ -26,7 +26,10 @@ PLOTTING_GUIDANCE = (
 
 mcp = FastMCP("veusz", instructions=(
     "Control the full native Veusz editor through its document API, without mouse automation. "
-    "Read veusz_status before editing. Pass the returned document_id and revision explicitly. "
+    "Read veusz_status before editing. Discover all installed native widget types and their "
+    "settings with veusz_widget_catalog; use veusz_add_widgets for any registered type, "
+    "and veusz_set_data for 1d, 2d, nd, text and datetime data. "
+    "Pass the returned document_id and revision explicitly. "
     "On REVISION_CONFLICT inspect the human's latest edits; never blindly retry. "
     "Keep request_id for uncertain operations and query veusz_operation. "
     "Never close, kill or restart the user's GUI. Start it with start_veusz.cmd if disconnected. "
@@ -68,10 +71,42 @@ def veusz_status() -> dict[str, Any]:
 
 @mcp.tool(annotations=READ)
 def veusz_inspect(paths: list[str] | None = None, settings_group: str | None = None) -> dict[str, Any]:
-    """Read absolute setting paths, or list a widget/settings group's valid child paths and values."""
+    """Read absolute settings, or list a group's child settings, values, types, choices and widget actions."""
     if settings_group:
         return invoke("describe", {"path": settings_group})
     return invoke("get", {"paths": paths or []})
+
+
+@mcp.tool(annotations=READ)
+def veusz_widget_catalog(widget_type: str | None = None, parent_path: str | None = None) -> dict[str, Any]:
+    """Discover ALL widget types registered in the running Veusz, including 3D and installed plugins.
+    Returns legal parent types and supported dataset kinds. Supply widget_type for its full recursive
+    settings schema (relative paths, defaults, choices, ranges and dataset dimensions).
+    Optional absolute parent_path marks which types can be placed there. Discovery never edits the document.
+    """
+    return invoke("widget_catalog", dict(widget_type=widget_type, parent_path=parent_path))
+
+
+@mcp.tool(annotations=WRITE)
+def veusz_set_data(datasets: list[dict], document_id: str, revision: int, replace: bool = False,
+                   request_id: str | None = None) -> dict[str, Any]:
+    """Set native datasets as one undoable batch. Entries: {name,type,data,...options}.
+    type: 1d (default), 2d (row-major matrix), nd, text, datetime (ISO 8601 strings; offsets convert to UTC).
+    1d options: symerr/poserr >=0, negerr <=0; arrays match data length.
+    2d options: xrange/yrange=[min,max], or xedge/yedge (size+1), or xcent/ycent (size), ascending.
+    Choose one coordinate form per axis. Numeric nulls represent missing values (NaN).
+    Existing names require replace=true. No Python execution or arbitrary command dispatch.
+    """
+    return invoke("set_data", dict(datasets=datasets, replace=replace), document_id, revision, request_id)
+
+
+@mcp.tool(annotations=WRITE)
+def veusz_widget_action(path: str, action: str, document_id: str, revision: int,
+                        request_id: str | None = None) -> dict[str, Any]:
+    """Run a native widget's registered action (e.g. fit); discover actions with veusz_inspect.
+    Absolute widget path required. Native operations are grouped for undo; no arbitrary Python.
+    """
+    return invoke("widget_action", dict(path=path, action=action), document_id, revision, request_id)
 
 
 @mcp.tool(annotations=WRITE)
@@ -107,7 +142,10 @@ def veusz_plot(series: list[dict], document_id: str, revision: int, page_name: s
 @mcp.tool(annotations=WRITE)
 def veusz_add_widgets(widgets: list[dict], document_id: str, revision: int,
                       request_id: str | None = None) -> dict[str, Any]:
-    """Add native page/graph/axis/xy/key/label widgets. Each entry: type,parent,name,settings.
+    """Add ANY registered native Veusz widget, including all 2D/3D chart families and installed plugins.
+    Discover legal types, parents and settings with veusz_widget_catalog first.
+    Each entry: type,parent (absolute),name,settings,optional autoadd (default true).
+    autoadd=false suppresses default children, useful for exact layouts. Batch order allows new parents.
     Nested formatting in settings uses double underscores, e.g. PlotLine__color. Names must be new.
     Use native editable widgets to implement optional Skill layout/annotation guidance.
     Report unsupported widget types rather than embedding a finished figure.
