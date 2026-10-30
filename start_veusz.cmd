@@ -8,4 +8,6 @@ if not exist "%task_python%" (
 )
 cd /d "%~dp0"
 "%task_python%" bridge_cli.py launch %*
-if errorlevel 1 pause
+set "task_exit=%errorlevel%"
+if not "%task_exit%"=="0" pause
+exit /b %task_exit%

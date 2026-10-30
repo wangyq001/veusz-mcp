@@ -32,10 +32,10 @@ class NativeContracts(unittest.TestCase):
         with patch.object(veusz_mcp, "invoke") as invoke:
             entries = [dict(name="z", type="2d", data=[[1, 2], [3, 4]])]
             veusz_mcp.veusz_set_data(entries, "doc", 7, request_id="stable")
-            invoke.assert_called_once_with("set_data", dict(datasets=entries, replace=False), "doc", 7, "stable")
+            invoke.assert_called_once_with("set_data", dict(datasets=entries, replace=False), "doc", 7, "stable", window_id=None)
         with patch.object(veusz_mcp, "invoke") as invoke:
             veusz_mcp.veusz_widget_action("/fit", "fit", "doc", 8, "action")
-            invoke.assert_called_once_with("widget_action", dict(path="/fit", action="fit"), "doc", 8, "action")
+            invoke.assert_called_once_with("widget_action", dict(path="/fit", action="fit"), "doc", 8, "action", window_id=None)
 
 
 if __name__ == "__main__":

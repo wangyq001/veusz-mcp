@@ -119,7 +119,7 @@ def request_window_foreground(state):
     user32.SetForegroundWindow(hwnd)
 
 
-def launch(executable=None, session_file=None):
+def launch(executable=None, session_file=None, label=None):
     context = desktop_context()
     if not context["desktop_is_interactive"]:
         raise RuntimeError(
@@ -136,12 +136,12 @@ def launch(executable=None, session_file=None):
         raise RuntimeError("Launch is already in progress; inspect the session before retrying")
     try:
         os.close(descriptor)
-        return _launch(executable, session_file)
+        return _launch(executable, session_file, label)
     finally:
         lock.unlink(missing_ok=True)
 
 
-def _launch(executable, session_file):
+def _launch(executable, session_file, label=None):
     pending_file = session_file.with_suffix(".starting.json")
     if pending_file.exists():
         pending = json.loads(pending_file.read_text(encoding="utf-8"))
@@ -179,7 +179,7 @@ def _launch(executable, session_file):
     for key in ("PYTHONPATH", "PYTHONHOME", "QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH"):
         env.pop(key, None)
     env.update(VEUSZ_BRIDGE_ROOT=str(ROOT), VEUSZ_BRIDGE_SESSION_FILE=str(session_file),
-               VEUSZ_BRIDGE_TOKEN=secrets.token_hex(32))
+               VEUSZ_BRIDGE_TOKEN=secrets.token_hex(32), VEUSZ_BRIDGE_LABEL=label or "")
     startupinfo = None
     if os.name == "nt":
         startupinfo = subprocess.STARTUPINFO()
@@ -227,19 +227,34 @@ def main():
     start = sub.add_parser("launch")
     start.add_argument("--exe", help="Veusz executable; alternatively set VEUSZ_EXE or veusz.local.json")
     start.add_argument("--demo", action="store_true", help="Create demo only when absent")
+    start.add_argument("--new-window", action="store_true", help="Create a separate native editor instead of reusing one")
+    start.add_argument("--name", default="Figure", help="Label for a new independent window")
+    start.add_argument("--start-host", action="store_true", help="Start the independent real-desktop launch host only")
     call = sub.add_parser("call")
-    call.add_argument("method", choices=("state", "demo", "get", "describe", "set", "undo", "snapshot", "export", "import_data", "plot", "add_widgets", "save", "open", "checkpoint", "operation", "close"))
+    call.add_argument("method", choices=("state", "demo", "get", "describe", "set", "undo", "snapshot", "export", "import_data", "import_file", "file_formats", "widget_catalog", "set_data", "widget_action", "window_view", "plot", "add_widgets", "save", "open", "checkpoint", "operation", "close"))
+    call.add_argument("--window-id", help="Stable editor identity from veusz_windows")
     payload = call.add_mutually_exclusive_group()
     payload.add_argument("--params", default="{}")
     payload.add_argument("--params-file", type=Path, help="UTF-8 JSON file; avoids shell quoting")
     args = parser.parse_args()
     if args.command == "launch":
-        result = launch(args.exe)
+        from veusz_bridge.desktop_host import ensure_host
+        host = ensure_host(allow_start=True)
+        if args.start_host:
+            print(json.dumps(host, ensure_ascii=True))
+            return
+        if args.new_window:
+            from veusz_bridge.windows import create_window
+            result = create_window(args.name, args.exe)
+        else:
+            result = launch(args.exe)
         if args.demo and not any(w["path"] == "/codex_demo" for w in result["state"]["widgets"]):
-            client = Client()
+            from veusz_bridge.windows import select_session
+            client = Client(select_session(result["state"]["bridge_id"]))
             result["state"] = client.call("demo", state=client.state())
     else:
-        client = Client()
+        from veusz_bridge.windows import select_session, has_multiple_sessions
+        client = Client(select_session(args.window_id)) if args.window_id or has_multiple_sessions() else Client()
         from veusz_bridge.protocol import WRITE_METHODS
         state = client.state() if args.method in WRITE_METHODS else None
         params = (json.loads(args.params_file.read_text(encoding="utf-8-sig"))

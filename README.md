@@ -4,7 +4,7 @@
 
 图形由 Veusz 的数据集、曲线、坐标轴、图例和文本对象组成，保存为可编辑的 `.vsz` 工程。绘图通过文档 API 完成，不依赖鼠标点击、屏幕坐标或整图截图替代。
 
-> 当前为 v0.2，主要验证环境是 Windows 10、Veusz 4.2.1 和 Codex。不是 Veusz 官方项目。
+> 当前为 v0.3（本地开发版），主要验证环境是 Windows 10、Veusz 4.2.1 和 Codex。不是 Veusz 官方项目。
 
 ![Veusz MCP native 3D plotting demo](docs/images/veusz-native-3d-demo.png)
 
@@ -14,7 +14,8 @@
 - 导入数值 CSV/TSV，创建折线、散点和对称误差棒。
 - 调整字体、字号、颜色、线宽、坐标范围、图例和标注。
 - 在 Veusz 中实时查看结果，继续手工编辑。
-- 保存原生工程，导出 PNG、SVG、PDF。
+- 保存 `.vsz`／`.vszh5` 原生工程，使用当前 Veusz 安装可用的全部原生导入和导出接口。
+- 同一个 MCP 会话管理多个独立编辑窗口，每张图可单独查看、修改和保存。
 - 读取用户最新修改，进行局部更新；版本冲突时拒绝覆盖。
 - 查询不确定操作的结果，减少断线或重试导致的重复绘图。
 - 按用户选择的绘图 Skill 应用格式规范，也可以完全不使用 Skill。
@@ -194,11 +195,53 @@ MCP 从运行中的 Veusz 部件工厂动态发现类型，不维护二维部件
 
 原生验收：在已连接且无模态提示框的 Veusz 上执行 `python tests/acceptance_native.py`。该脚本通过真实 MCP 测试全部可创建类型的参数发现、创建与撤销，以及五类数据、失败回滚和版本冲突；临时测试内容会撤销。
 
+## 多窗口：每张独立图保留自己的编辑器
+
+新的独立图默认应先调用 `veusz_new_window`，而不是把所有图反复画到原来的页面。用户明确要求子图或多页工程时才复用同一文档。
+
+1. `veusz_new_window(name="Figure A", request_id="unique-launch-id")` 创建独立 Veusz 进程和窗口，返回稳定的 `window_id`。启动结果不确定时复用同一 `request_id`，避免重复开窗。
+2. `veusz_windows` 列出窗口、连接状态、文档和可见性，不返回令牌。窗口关闭后会标记为不可用，不会把操作转发给其他窗口。
+3. 对目标窗口调用 `veusz_status(window_id=...)`，再给读写工具同时传入 `window_id`、`document_id`、`revision`。各窗口保留独立数据、修改状态和撤销历史。
+4. `veusz_arrange_windows(window_ids=[...], columns=2)` 可排列指定窗口并适合页面；`veusz_window_view` 可单独切换页码、恢复窗口和适合页面。
+5. 多窗口情况下，未明确目标的读取会报告 `AMBIGUOUS_WINDOW`。旧调用中的写入仍可按唯一文档标识路由，但推荐始终显式给出 `window_id`，避免等待其他窗口。
+
+也可直接从真实桌面运行：
+
+```powershell
+.\start_veusz.cmd --new-window --name "Figure A"
+.\start_veusz.cmd --new-window --name "Figure B"
+```
+
+启动脚本会启动一个独立的本机桌面宿主。它只接收带令牌的本机启动请求，使 Veusz 不会被 MCP 客户端在重连时连带清理。宿主不注册系统服务或登录启动项；未运行时可从真实桌面执行 `start_veusz.cmd --start-host`。不能从隔离桌面偷偷启动宿主。
+
+桌面宿主与各 Veusz 窗口独立于 MCP 服务。重连 MCP 不会关闭图；重启电脑或注销后，仍需重新启动脚本并打开已保存工程。不要删除运行中窗口的会话文件。
+
+## 文件格式：以当前安装能力为准
+
+- 先调用 `veusz_file_formats(window_id=...)`，查询原生导出格式、工程支持、文件导入命令的必填参数及已安装导入插件。
+- `veusz_import_file` 只调用 Veusz 注册的文件导入器，不开放任意 Python 或任意方法执行。支持原生文本、CSV、二维／多维文本、HDF5、FITS，以及插件提供的 NPY、NPZ、QDP、二进制、VO 表等格式；实际清单由目标安装决定。
+- `veusz_export` 按原生目录验证格式，支持 `quality`、`color`、`antialias`、`pdfdpi`、`svgdpi`、`svgtextastext` 等选项。用 `pages=[0,1]` 导出多页 PDF／PS；其他格式仍限一页。
+- 导出先生成临时文件，确认非空后再原子替换目标；失败不会用空文件覆盖已有输出。格式内容和布局仍应单独检查。
+- `.vszh5` 保存会做原生重开预检。针对 Veusz 4.2.1 的 HDF5 加载器无法读回 ND 数据的问题，多维数组使用工程中的原生 `SetDataND` 文本命令编码，仍可由未安装本 MCP 的 Veusz 打开。
+- EPS／PS 依赖 Ghostscript，HDF5 依赖 h5py，FITS／VO 表依赖相应天文数据模块。缺少依赖时明确报告不可用。
+
+本轮本地验收通过：14 个导入用例、BMP／EMF／JPG／JPEG／PDF／PNG／SVG／TIFF／WebP／XPM 导出、两页 PDF，以及 `.vsz`／`.vszh5` 往返。当前机器缺少可用 Ghostscript，所以 EPS／PS 未声称通过。第三方插件或复杂参数组合不等于已经全部验收。
+
+升级时须重新连接一次 MCP，加载新增工具和 `window_id` 参数。旧窗口可以保留；新接口应在随后新建的窗口中使用。旧插件不支持的方法需保存工作后由用户重启该窗口，智能体不会丢弃未保存图形。
+
+新增真实验收脚本：`tests/acceptance_formats.py` 需要通过 `VEUSZ_SESSION_FILE` 指定独立空白测试窗口；`tests/acceptance_windows.py` 创建三张测试图，验证独立编辑、排列和 MCP 重连，并保留窗口用于查看。它们不是日常绘图入口，不应运行在重要工作文档上。
+
 ## 工具一览
 
 | 工具 | 用途 |
 |---|---|
 | `veusz_status` | 连接、文档版本、桌面身份、数据、对象树、弹窗和渲染状态 |
+| `veusz_windows` | 列出独立窗口及稳定的窗口标识 |
+| `veusz_new_window` | 创建独立原生编辑窗口，保留已有图 |
+| `veusz_arrange_windows` | 排列指定的多个窗口并适合页面 |
+| `veusz_window_view` | 恢复一个窗口、切换页面、调整显示范围 |
+| `veusz_file_formats` | 查询安装实例的格式、依赖和导入参数 |
+| `veusz_import_file` | 调用已注册的原生文件导入器及格式插件 |
 | `veusz_inspect` | 查询有效属性路径、设置分组和当前值 |
 | `veusz_widget_catalog` | 动态查询全部已注册部件、父对象要求及递归参数定义 |
 | `veusz_set_data` | 写入一维、二维、多维、文本和日期数据 |
@@ -208,16 +251,16 @@ MCP 从运行中的 Veusz 部件工厂动态发现类型，不维护二维部件
 | `veusz_add_widgets` | 添加任意已注册的原生二维／三维部件 |
 | `veusz_apply_changes` | 验证后的局部属性修改 |
 | `veusz_undo` | 撤销最近且未被后续编辑改变的桥接操作 |
-| `veusz_save` | 保存可编辑 `.vsz` 和数据来源清单 |
+| `veusz_save` | 保存可编辑 `.vsz`／`.vszh5` 和数据来源清单 |
 | `veusz_checkpoint` | 保存恢复点，保留当前工作文件名和编辑状态 |
 | `veusz_open` | 经过预检打开工程，拒绝丢弃未保存修改 |
 | `veusz_preview` | 返回带文档版本的 PNG 预览 |
-| `veusz_export` | 导出当前页或指定页为 PNG、SVG、PDF |
+| `veusz_export` | 使用原生可用格式导出；支持多页 PDF／PS |
 | `veusz_operation` | 查询已提交写请求的状态与结果 |
 
 工具使用约定：
 
-1. 修改前先读状态，显式携带 `document_id` 和 `revision`。
+1. 修改前先读目标窗口状态，显式携带 `window_id`、`document_id` 和 `revision`。
 2. 发生 `REVISION_CONFLICT` 时读取用户最新修改，重新判断局部改动；不能只更新版本号后盲目重放。
 3. 操作结果不确定时查询原 `request_id`，不要直接重复写入。
 4. 预览是渲染结果，不等于用户已看到窗口；桌面身份及真实显示应分别核验。
@@ -225,15 +268,15 @@ MCP 从运行中的 Veusz 部件工厂动态发现类型，不维护二维部件
 ## 数据与安全边界
 
 - CSV/TSV 需要唯一列名和数值列。默认拒绝缺失、非数值及非有限值；`missing=drop_rows` 会对所有选中列同步删除不完整的整行。
-- 输入上限为 50 MiB、100 万行、200 万个选中数值；不自动补值、改单位或混合多张表。
+- 严格数值 CSV/TSV 工具的输入上限为 50 MiB、100 万行、200 万个选中数值。原生文件导入按对应导入器规则读取，不要求把大型文件内容放入 JSON 请求。
 - 覆盖数据集须显式 `replace=true`；对数坐标要求正数。
 - 页码从 0 开始，导出默认使用当前页，DPI 范围为 50–1200。
 - 输出工程、预览、导出与恢复点限定在项目目录中；数值输入可来自用户指定的本地文件。
 - 桥接仅监听 `127.0.0.1`，使用随机会话令牌；不提供通用任意 Python 执行工具。
-- Veusz 文档操作在 Qt 主线程执行；当前每个受控进程只支持一个编辑窗口。
+- Veusz 文档操作在 Qt 主线程执行；每个受控进程管理一个窗口，MCP 同时路由多个这样的进程。
 - MCP 断开不会关闭 Veusz；不会自动强制结束用户进程。
 - 用户在界面中的编辑会更新版本，但不会在聊天空闲时自动唤醒模型。
-- 保存的 `.vsz.json` 记录数据来源；恢复点按需创建，目前没有定时自动保存。
+- 保存的 `.vsz.json`／`.vszh5.json` 记录数据来源；恢复点按需创建，目前没有定时自动保存。
 - 撤销和补偿覆盖本版验证过的设置、数据和对象添加，不承诺任意第三方插件操作具有完整事务性。
 
 `runtime/` 中包含私密会话令牌和操作记录，**不要上传或分享**。本地 `output/`、虚拟环境、安装路径配置和编译翻译文件均默认被 Git 忽略。
@@ -245,6 +288,8 @@ MCP 从运行中的 Veusz 部件工厂动态发现类型，不维护二维部件
 ```powershell
 .\.venv\Scripts\python.exe .\diagnose.py
 ```
+
+多窗口时，该命令先列出窗口清单；可用 `diagnose.py --window-id <窗口标识>` 检查其中一个，不会因为旧默认窗口已关闭而把其他窗口误报为断线。
 
 诊断会分别显示当前命令所在桌面与已连接 Veusz 所在桌面。命令在沙箱中运行、Veusz 在真实桌面中运行，是可能且正常的组合；判断窗口应查看连接本身的 `desktop_is_interactive`。
 

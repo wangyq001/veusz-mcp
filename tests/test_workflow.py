@@ -27,7 +27,7 @@ class WorkflowTests(unittest.TestCase):
         original = copy.deepcopy(state)
         with patch.object(veusz_mcp, "invoke", return_value=state) as invoke:
             result = veusz_mcp.veusz_status()
-        invoke.assert_called_once_with("state")
+        invoke.assert_called_once_with("state", window_id=None)
         self.assertEqual(state, original)
         self.assertEqual({key: result[key] for key in original}, original)
         workflow = result["plotting_workflow"]
@@ -80,7 +80,8 @@ class WorkflowProtocolTests(unittest.IsolatedAsyncioTestCase):
                         initialized = await session.initialize()
                         self.assertIn(veusz_mcp.PLOTTING_GUIDANCE, initialized.instructions)
                         tools = {tool.name: tool for tool in (await session.list_tools()).tools}
-                        self.assertEqual(len(tools), 16)
+                        self.assertTrue({"veusz_widget_catalog", "veusz_set_data", "veusz_widget_action",
+                                         "veusz_file_formats", "veusz_import_file"} <= tools.keys())
                         for name in ("veusz_status", "veusz_plot", "veusz_add_widgets",
                                      "veusz_apply_changes"):
                             self.assertIn("Skill", tools[name].description)

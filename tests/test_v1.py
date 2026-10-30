@@ -80,7 +80,8 @@ class JournalTests(unittest.TestCase):
                 req = {"id": str(i), "token": "token", "method": "set" if i % 10 == 0 else "state"}
                 job = b.submit(req)
                 b.execute(job, lambda _: {"sequence": i})
-                self.assertTrue(b.await_result(job)["ok"])
+                result = b.await_result(job)
+                self.assertTrue(result["ok"], result)
                 if i == 0:
                     first = req
                 count += 1

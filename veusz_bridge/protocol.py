@@ -10,8 +10,8 @@ from collections import OrderedDict
 from pathlib import Path
 
 MAX_MESSAGE = 2 * 1024 * 1024
-WRITE_METHODS = frozenset(("set", "demo", "undo", "import_data", "plot", "add_widgets", "set_data", "widget_action",
-                           "save", "open", "checkpoint", "close", "export", "snapshot"))
+WRITE_METHODS = frozenset(("set", "demo", "undo", "import_data", "import_file", "plot", "add_widgets", "set_data", "widget_action",
+                           "save", "open", "checkpoint", "close", "export", "snapshot", "window_view"))
 
 
 class BridgeError(Exception):

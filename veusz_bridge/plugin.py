@@ -14,6 +14,8 @@ from veusz.document import operations
 
 from .protocol import BridgeError, Broker, LocalServer, WRITE_METHODS
 from .desktop import desktop_context
+from .formats import (format_catalog, import_arguments, prepare_source, export_options,
+                      hdf5_nd_compatibility)
 from .native import (widget_catalog, validate_widgets, prepare_datasets,
                      setting_info, json_value)
 
@@ -47,6 +49,7 @@ class Bridge(qt.QObject):
         self.events = []
         self.source = "gui"
         self.bridge_id = str(uuid.uuid4())
+        self.window_label = os.environ.get("VEUSZ_BRIDGE_LABEL", "")
         self.sources = []
         self.rendered = None
         self.render_jobs = {}
@@ -71,6 +74,9 @@ class Bridge(qt.QObject):
         if len(windows) != 1:
             return
         self.window = windows[0]
+        if self.window_label:
+            self.window.windowTitleChanged.connect(self.label_title)
+            self.label_title(self.window.windowTitle())
         # The launcher is user-facing: make the editor window visible and ask
         # Windows to activate it before publishing the bridge session.
         self.window.showNormal()
@@ -91,6 +97,7 @@ class Bridge(qt.QObject):
         self.server = LocalServer(self.broker)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         info = {"protocol": 2, "bridge_version": "0.1.0", "bridge_id": self.bridge_id,
+                "window_label": self.window_label,
                 "host": "127.0.0.1", "port": self.server.server_address[1],
                 "token": self.token, "pid": os.getpid(), "veusz_version": utils.version(),
                 "document_id": self.document_id, "started_at": time.time()}
@@ -98,6 +105,11 @@ class Bridge(qt.QObject):
         temporary = self.session_file.with_suffix(".tmp")
         temporary.write_text(json.dumps(info), encoding="utf-8")
         os.replace(str(temporary), str(self.session_file))
+
+    def label_title(self, title):
+        prefix = self.window_label + " | "
+        if not title.startswith(prefix):
+            self.window.setWindowTitle(prefix + title)
 
     def shutdown(self):
         if hasattr(self, "server"):
@@ -121,6 +133,11 @@ class Bridge(qt.QObject):
             try:
                 job.prepared = read_table(p["path"], p["columns"], p.get("delimiter"),
                                           p.get("missing", "error"), p.get("encoding", "utf-8-sig"))
+            except Exception as exc:
+                job.preparation_error = exc
+        if job.request["method"] == "import_file":
+            try:
+                job.prepared = prepare_source(job.request.get("params", {})["path"])
             except Exception as exc:
                 job.preparation_error = exc
         self.requested.emit(job)
@@ -158,7 +175,11 @@ class Bridge(qt.QObject):
         visit(self.doc.basewidget)
         modal = self.app.activeModalWidget()
         native = self.native_window_state()
+        screen = self.window.screen() if hasattr(self.window, "screen") else self.app.primaryScreen()
+        area = screen.availableGeometry()
         return {"document_id": self.document_id, "revision": self.revision,
+                "window_id": self.bridge_id, "window_label": self.window_label,
+                "window_screen_geometry": [area.x(), area.y(), area.width(), area.height()],
                 "bridge_version": "0.1.0", "bridge_id": self.bridge_id,
                 "pid": os.getpid(), "veusz_version": utils.version(),
                 "python": sys.version.split()[0], "qt": qt.QT_VERSION_STR,
@@ -261,6 +282,29 @@ class Bridge(qt.QObject):
             return self.broker.status(params["request_id"])
         if method == "state":
             return self.state()
+        if method == "file_formats":
+            return format_catalog(self.ci)
+        if method == "window_view":
+            self.check_write(request)
+            geometry = params.get("geometry")
+            if geometry is not None:
+                if (not isinstance(geometry, list) or len(geometry) != 4 or
+                        any(type(v) is not int for v in geometry) or geometry[2] < 240 or geometry[3] < 200):
+                    raise BridgeError("BAD_REQUEST", "geometry must be [x,y,width,height] in Qt desktop units")
+                if not any(screen.availableGeometry().contains(qt.QRect(*geometry)) for screen in self.app.screens()):
+                    raise BridgeError("BAD_REQUEST", "Window must fit inside a visible screen work area")
+            page = params.get("page", self.window.plot.pagenumber)
+            if type(page) is not int or not 0 <= page < self.doc.getNumberPages():
+                raise BridgeError("BAD_PAGE", "Choose an existing zero-based page")
+            if type(params.get("fit_page", True)) is not bool:
+                raise BridgeError("BAD_REQUEST", "fit_page must be boolean")
+            self.window.showNormal()
+            if geometry is not None:
+                self.window.setGeometry(*geometry)
+            self.window.plot.setPageNumber(page)
+            if params.get("fit_page", True):
+                self.window.plot.slotViewZoomPage()
+            return self.state()
         if method == "widget_catalog":
             return {**widget_catalog(self.doc, params.get("widget_type"), params.get("parent_path")),
                     "document_id": self.document_id, "revision": self.revision}
@@ -293,16 +337,16 @@ class Bridge(qt.QObject):
         if method == "export":
             self.check_write(request)
             path = self.output_path(params.get("path", "output/preview.png"))
-            if path.suffix.lower() not in (".png", ".svg", ".pdf"):
-                raise BridgeError("BAD_PATH", "POC supports PNG, SVG and PDF")
-            page = params.get("page", self.window.plot.pagenumber)
-            if type(page) is not int or not 0 <= page < self.doc.getNumberPages():
-                raise BridgeError("BAD_PAGE", "Page index is zero-based and must exist")
-            dpi = params.get("dpi", 150)
-            if type(dpi) is not int or not 50 <= dpi <= 1200:
-                raise BridgeError("BAD_REQUEST", "DPI must be 50..1200")
-            self.ci.Export(str(path), page=page, dpi=dpi,
-                           backcolor=params.get("background", "#ffffffff"))
+            options = export_options(params, params.get("page", self.window.plot.pagenumber),
+                                     self.doc.getNumberPages(), format_catalog(self.ci)["exports"], path.suffix.lower())
+            temporary = path.with_name(path.stem + "." + uuid.uuid4().hex + path.suffix.lower())
+            try:
+                self.ci.Export(str(temporary), **options)
+                if not temporary.is_file() or not temporary.stat().st_size:
+                    raise BridgeError("EXPORT_FAILED", "Native exporter did not create a nonempty file")
+                os.replace(str(temporary), str(path))
+            finally:
+                temporary.unlink(missing_ok=True)
             return {"path": str(path), "revision": self.revision}
         if method not in WRITE_METHODS:
             raise BridgeError("UNKNOWN_METHOD", "Unsupported method: " + method)
@@ -317,6 +361,16 @@ class Bridge(qt.QObject):
                 self.undo_last_bridge_operation()
             elif method == "import_data":
                 self.import_prepared(prepared, params)
+            elif method == "import_file":
+                before = dict(self.doc.data)
+                method_fn, kwargs = import_arguments(self.ci, params["command"], prepared["source"], params.get("options", {}))
+                def native_import():
+                    method_fn(**kwargs)
+                    if not params.get("replace", False) and any(
+                            name in before and before[name] is not ds for name, ds in self.doc.data.items()):
+                        raise BridgeError("DATA_EXISTS", "Import would replace data; set replace=true explicitly")
+                self.grouped(native_import, "Codex: native file import")
+                self.sources.append({**prepared, "importer": params["command"]})
             elif method == "plot":
                 self.create_plot(params)
             elif method == "add_widgets":
@@ -554,24 +608,37 @@ class Bridge(qt.QObject):
     def save_document(self, params, checkpoint=False):
         default = "runtime/checkpoints/%s-%s.vsz" % (self.document_id, self.revision)
         path = self.output_path(params.get("path", default if checkpoint else "output/figure.vsz"))
-        if path.suffix.lower() != ".vsz":
-            raise BridgeError("BAD_PATH", "Native document extension must be .vsz")
+        if path.suffix.lower() not in (".vsz", ".vszh5"):
+            raise BridgeError("BAD_PATH", "Native document extension must be .vsz or .vszh5")
         if path.exists() and not params.get("overwrite", False):
             raise BridgeError("FILE_EXISTS", "Set overwrite explicitly to replace an existing file")
-        text = self.serialize(path)
         temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
         try:
-            with temporary.open("w", encoding="utf-8", newline="\n") as stream:
-                stream.write(text)
-                stream.flush()
-                os.fsync(stream.fileno())
+            if path.suffix.lower() == ".vsz":
+                text = self.serialize(path)
+                with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+                    stream.write(text)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            else:
+                original = self.doc.modified, self.doc.changeset, self.doc.filename
+                self.doc.suspendUpdates()
+                try:
+                    self.doc.save(str(temporary), mode="hdf5")
+                    hdf5_nd_compatibility(self.doc, temporary)
+                    candidate = document.Document()
+                    candidate.load(str(temporary), mode="hdf5", callbackunsafe=lambda: False,
+                                   callbackimporterror=lambda filename, error: None)
+                finally:
+                    self.doc.modified, self.doc.changeset, self.doc.filename = original
+                    self.doc.enableUpdates()
             os.replace(str(temporary), str(path))
         finally:
             if temporary.exists():
                 temporary.unlink()
         manifest = {"bridge_version": "0.1.0", "data_sources": self.sources,
                     "document_id": self.document_id, "revision": self.revision}
-        path.with_suffix(".vsz.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        Path(str(path) + ".json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         if not checkpoint:
             self.doc.filename = self.window.filename = str(path)
             self.doc.setModified(False)
@@ -582,11 +649,11 @@ class Bridge(qt.QObject):
         if self.doc.isModified():
             raise BridgeError("UNSAVED_CHANGES", "Save current changes before opening a document")
         path = self.output_path(params["path"])
-        if path.suffix.lower() != ".vsz" or not path.is_file():
-            raise BridgeError("BAD_PATH", "Choose an existing .vsz document in the project")
+        if path.suffix.lower() not in (".vsz", ".vszh5") or not path.is_file():
+            raise BridgeError("BAD_PATH", "Choose an existing .vsz or .vszh5 document in the project")
         candidate = document.Document()
         try:
-            candidate.load(str(path), callbackunsafe=lambda: False,
+            candidate.load(str(path), mode="hdf5" if path.suffix.lower() == ".vszh5" else "vsz", callbackunsafe=lambda: False,
                            callbackimporterror=lambda filename, error: None)
         except Exception as exc:
             raise BridgeError("OPEN_FAILED", "Document preflight failed without changing current document: " + str(exc))
@@ -595,7 +662,7 @@ class Bridge(qt.QObject):
         self.window.openFileInWindow(str(path))
         if self.doc.filename != str(path):
             raise BridgeError("OPEN_FAILED", "Veusz did not open the requested document")
-        manifest = path.with_suffix(".vsz.json")
+        manifest = Path(str(path) + ".json")
         self.sources = json.loads(manifest.read_text(encoding="utf-8")).get("data_sources", []) if manifest.exists() else []
 
     def create_demo(self):

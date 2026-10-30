@@ -12,6 +12,9 @@ from mcp.server.fastmcp.utilities.types import Image
 from mcp.types import ToolAnnotations
 
 from veusz_bridge.client import Client, RemoteError
+from veusz_bridge.protocol import BridgeError
+from veusz_bridge.windows import (create_window, list_windows, select_session, has_multiple_sessions,
+                                 arrange_windows)
 
 PLOTTING_GUIDANCE = (
     "Render final plots requested through this server as native editable Veusz objects. "
@@ -22,6 +25,8 @@ PLOTTING_GUIDANCE = (
     "Without a Skill, plot normally without requiring one. Do not assume, scan for or install Skills. "
     "Code may compute data, but do not execute a Skill's plotting backend or embed a finished image "
     "as a substitute for native plotting. Report unsupported effects instead of silently switching backends."
+    " For each new standalone figure create a separate editor with veusz_new_window unless the user "
+    "explicitly requests subplots or pages in one document. Preserve previous figure windows."
 )
 
 mcp = FastMCP("veusz", instructions=(
@@ -36,29 +41,83 @@ mcp = FastMCP("veusz", instructions=(
     "Launch GUI processes only from the user's interactive desktop using approved desktop execution; "
     "a sandbox desktop is not a visible user window. Verify desktop_is_interactive is true before "
     "reporting that the window is displayed; window_visible alone is insufficient. "
+    "For separate figures create independent editors with veusz_new_window; its desktop launch host must "
+    "first be started by start_veusz.cmd --start-host using approved desktop execution. Inspect veusz_windows and "
+    "pass window_id explicitly to every operation when several editors exist. Never silently replace "
+    "a previous figure with the next one. Do not confuse veusz_plot's three shortcuts with the full widget catalog. "
     + PLOTTING_GUIDANCE))
 
 READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
 WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False)
 
 
-def invoke(method, params=None, document_id=None, revision=None, request_id=None):
+def invoke(method, params=None, document_id=None, revision=None, request_id=None, window_id=None):
     rid = request_id or str(uuid.uuid4())
     try:
-        client = Client()
+        client = (Client(select_session(window_id, document_id))
+                  if window_id is not None or has_multiple_sessions() else Client())
         if client.session.get("bridge_version") != "0.1.0":
             raise ToolError("BRIDGE_VERSION: start the v0.1 GUI using start_veusz.cmd")
         state = {"document_id": document_id, "revision": revision} if document_id is not None else None
         result = client.call(method, params, state=state, request_id=rid, timeout_ms=30000)
         return result
-    except (OSError, ValueError, RemoteError) as exc:
-        raise ToolError("%s; request_id=%s. Inspect status/result before retrying writes." % (exc, rid)) from exc
+    except (OSError, ValueError, RemoteError, BridgeError) as exc:
+        detail = "%s: %s" % (exc.code, exc) if isinstance(exc, BridgeError) else str(exc)
+        raise ToolError("%s; request_id=%s. Inspect status/result before retrying writes." % (detail, rid)) from exc
 
 
 @mcp.tool(annotations=READ)
-def veusz_status() -> dict[str, Any]:
+def veusz_windows() -> dict[str, Any]:
+    """List independently connected editors, their stable window_id, document/revision and visibility.
+    Closed or unreachable windows are reported, never silently replaced with another editor.
+    """
+    return list_windows()
+
+
+@mcp.tool(annotations=WRITE)
+def veusz_arrange_windows(window_ids: list[str], columns: int = 2) -> dict[str, Any]:
+    """Tile only the specified editor windows in the first target's screen work area and fit their pages.
+    Leaves other editors and all document content unchanged. Reports per-window errors without retries.
+    """
+    try:
+        return arrange_windows(window_ids, columns)
+    except (OSError, ValueError, RuntimeError, BridgeError) as exc:
+        raise ToolError(str(exc)) from exc
+
+
+@mcp.tool(annotations=WRITE)
+def veusz_window_view(document_id: str, revision: int, window_id: str,
+                      page: int | None = None, fit_page: bool = True,
+                      geometry: list[int] | None = None, request_id: str | None = None) -> dict[str, Any]:
+    """Restore one editor, select a page and fit it. Optional geometry is [x,y,width,height] in Qt units.
+    Does not edit data, settings or undo history. It never closes other windows.
+    """
+    params = {"fit_page": fit_page}
+    if page is not None:
+        params["page"] = page
+    if geometry is not None:
+        params["geometry"] = geometry
+    return invoke("window_view", params, document_id, revision, request_id, window_id=window_id)
+
+
+@mcp.tool(annotations=WRITE)
+def veusz_new_window(name: str = "Figure", executable: str | None = None,
+                      request_id: str | None = None) -> dict[str, Any]:
+    """Create a separate editable Veusz process/window on the real desktop, leaving existing figures intact.
+    Reuse request_id after an uncertain launch to avoid duplicates. Pass the returned window_id to tools.
+    Requires an interactive desktop host; sandbox hosts must use approved desktop execution of
+    start_veusz.cmd --new-window --name NAME and then list windows. Never bypass desktop permissions.
+    """
+    try:
+        return create_window(name, executable, request_id)
+    except (OSError, ValueError, RuntimeError, BridgeError) as exc:
+        raise ToolError(str(exc)) from exc
+
+
+@mcp.tool(annotations=READ)
+def veusz_status(window_id: str | None = None) -> dict[str, Any]:
     """Read document state and plotting_workflow: native editable output, with an optional user/client Skill."""
-    state = invoke("state")
+    state = invoke("state", window_id=window_id)
     return {**state, "plotting_workflow": {
         "output_backend": "veusz_native",
         "editable_output": True,
@@ -70,26 +129,47 @@ def veusz_status() -> dict[str, Any]:
 
 
 @mcp.tool(annotations=READ)
-def veusz_inspect(paths: list[str] | None = None, settings_group: str | None = None) -> dict[str, Any]:
+def veusz_inspect(paths: list[str] | None = None, settings_group: str | None = None, window_id: str | None = None) -> dict[str, Any]:
     """Read absolute settings, or list a group's child settings, values, types, choices and widget actions."""
     if settings_group:
-        return invoke("describe", {"path": settings_group})
-    return invoke("get", {"paths": paths or []})
+        return invoke("describe", {"path": settings_group}, window_id=window_id)
+    return invoke("get", {"paths": paths or []}, window_id=window_id)
 
 
 @mcp.tool(annotations=READ)
-def veusz_widget_catalog(widget_type: str | None = None, parent_path: str | None = None) -> dict[str, Any]:
+def veusz_widget_catalog(widget_type: str | None = None, parent_path: str | None = None, window_id: str | None = None) -> dict[str, Any]:
     """Discover ALL widget types registered in the running Veusz, including 3D and installed plugins.
     Returns legal parent types and supported dataset kinds. Supply widget_type for its full recursive
     settings schema (relative paths, defaults, choices, ranges and dataset dimensions).
     Optional absolute parent_path marks which types can be placed there. Discovery never edits the document.
     """
-    return invoke("widget_catalog", dict(widget_type=widget_type, parent_path=parent_path))
+    return invoke("widget_catalog", dict(widget_type=widget_type, parent_path=parent_path), window_id=window_id)
+
+
+@mcp.tool(annotations=READ)
+def veusz_file_formats(window_id: str | None = None) -> dict[str, Any]:
+    """Discover native export formats, project formats, file import commands/parameters and import plugins.
+    Availability depends on the target Veusz installation, Qt image writers and optional dependencies.
+    """
+    return invoke("file_formats", window_id=window_id)
+
+
+@mcp.tool(annotations=WRITE)
+def veusz_import_file(path: str, command: str, document_id: str, revision: int,
+                      options: dict | None = None, replace: bool = False,
+                      request_id: str | None = None, window_id: str | None = None) -> dict[str, Any]:
+    """Import any installed native file format using a registered importer, without Python execution.
+    First inspect veusz_file_formats for command names, required options, and plugin fields.
+    Covers native text/CSV/2D/ND/HDF5/FITS and registered format plugins (e.g. NPY/NPZ/QDP).
+    Input is a local file; dataset replacement is refused unless replace=true. One undoable operation.
+    """
+    return invoke("import_file", dict(path=path, command=command, options=options or {}, replace=replace),
+                  document_id, revision, request_id, window_id=window_id)
 
 
 @mcp.tool(annotations=WRITE)
 def veusz_set_data(datasets: list[dict], document_id: str, revision: int, replace: bool = False,
-                   request_id: str | None = None) -> dict[str, Any]:
+                   request_id: str | None = None, window_id: str | None = None) -> dict[str, Any]:
     """Set native datasets as one undoable batch. Entries: {name,type,data,...options}.
     type: 1d (default), 2d (row-major matrix), nd, text, datetime (ISO 8601 strings; offsets convert to UTC).
     1d options: symerr/poserr >=0, negerr <=0; arrays match data length.
@@ -97,34 +177,34 @@ def veusz_set_data(datasets: list[dict], document_id: str, revision: int, replac
     Choose one coordinate form per axis. Numeric nulls represent missing values (NaN).
     Existing names require replace=true. No Python execution or arbitrary command dispatch.
     """
-    return invoke("set_data", dict(datasets=datasets, replace=replace), document_id, revision, request_id)
+    return invoke("set_data", dict(datasets=datasets, replace=replace), document_id, revision, request_id, window_id=window_id)
 
 
 @mcp.tool(annotations=WRITE)
 def veusz_widget_action(path: str, action: str, document_id: str, revision: int,
-                        request_id: str | None = None) -> dict[str, Any]:
+                        request_id: str | None = None, window_id: str | None = None) -> dict[str, Any]:
     """Run a native widget's registered action (e.g. fit); discover actions with veusz_inspect.
     Absolute widget path required. Native operations are grouped for undo; no arbitrary Python.
     """
-    return invoke("widget_action", dict(path=path, action=action), document_id, revision, request_id)
+    return invoke("widget_action", dict(path=path, action=action), document_id, revision, request_id, window_id=window_id)
 
 
 @mcp.tool(annotations=WRITE)
 def veusz_import_data(path: str, columns: dict[str, str], document_id: str, revision: int,
                       missing: str = "error", delimiter: str | None = None,
                       encoding: str = "utf-8-sig", replace: bool = False,
-                      request_id: str | None = None) -> dict[str, Any]:
+                      request_id: str | None = None, window_id: str | None = None) -> dict[str, Any]:
     """Import numeric CSV/TSV. columns maps dataset names to headers. missing='error' or 'drop_rows'.
     Drop rows consistently across selected columns. Does not change units. Existing datasets require replace=true.
     """
     return invoke("import_data", dict(path=path, columns=columns, missing=missing,
-                  delimiter=delimiter, encoding=encoding, replace=replace), document_id, revision, request_id)
+                  delimiter=delimiter, encoding=encoding, replace=replace), document_id, revision, request_id, window_id=window_id)
 
 
 @mcp.tool(annotations=WRITE)
 def veusz_plot(series: list[dict], document_id: str, revision: int, page_name: str = "figure1",
                graph_path: str | None = None, x_label: str | None = None, y_label: str | None = None,
-               x_log: bool | None = None, y_log: bool | None = None, request_id: str | None = None) -> dict[str, Any]:
+               x_log: bool | None = None, y_log: bool | None = None, request_id: str | None = None, window_id: str | None = None) -> dict[str, Any]:
     """Create native line/scatter/errorbar series. Each series: x,y dataset names; optional name,label,
     kind,color,width,error (symmetric-error dataset). Use a new page_name or an existing graph_path.
     All changes form one undoable operation. Log coordinates must be positive.
@@ -136,12 +216,12 @@ def veusz_plot(series: list[dict], document_id: str, revision: int, page_name: s
                         ("x_log", x_log), ("y_log", y_log)):
         if value is not None:
             params[name] = value
-    return invoke("plot", params, document_id, revision, request_id)
+    return invoke("plot", params, document_id, revision, request_id, window_id=window_id)
 
 
 @mcp.tool(annotations=WRITE)
 def veusz_add_widgets(widgets: list[dict], document_id: str, revision: int,
-                      request_id: str | None = None) -> dict[str, Any]:
+                      request_id: str | None = None, window_id: str | None = None) -> dict[str, Any]:
     """Add ANY registered native Veusz widget, including all 2D/3D chart families and installed plugins.
     Discover legal types, parents and settings with veusz_widget_catalog first.
     Each entry: type,parent (absolute),name,settings,optional autoadd (default true).
@@ -150,75 +230,84 @@ def veusz_add_widgets(widgets: list[dict], document_id: str, revision: int,
     Use native editable widgets to implement optional Skill layout/annotation guidance.
     Report unsupported widget types rather than embedding a finished figure.
     """
-    return invoke("add_widgets", {"widgets": widgets}, document_id, revision, request_id)
+    return invoke("add_widgets", {"widgets": widgets}, document_id, revision, request_id, window_id=window_id)
 
 
 @mcp.tool(annotations=WRITE)
 def veusz_apply_changes(changes: list[dict], document_id: str, revision: int,
-                         request_id: str | None = None) -> dict[str, Any]:
+                         request_id: str | None = None, window_id: str | None = None) -> dict[str, Any]:
     """Batch absolute setting changes, each {path,value}. Read valid paths with veusz_inspect first.
     Preserves settings omitted from the patch. Validated before mutation, with one native undo step.
     Translate optional Skill styling guidance into this patch, prioritizing user requirements
     and preserving manual changes outside the requested scope. No Skill is required.
     """
-    return invoke("set", {"changes": changes}, document_id, revision, request_id)
+    return invoke("set", {"changes": changes}, document_id, revision, request_id, window_id=window_id)
 
 
 @mcp.tool(annotations=WRITE)
-def veusz_undo(document_id: str, revision: int, request_id: str | None = None) -> dict[str, Any]:
+def veusz_undo(document_id: str, revision: int, request_id: str | None = None, window_id: str | None = None) -> dict[str, Any]:
     """Undo only the latest unchanged bridge operation. Refuse to undo intervening human edits."""
-    return invoke("undo", {}, document_id, revision, request_id)
+    return invoke("undo", {}, document_id, revision, request_id, window_id=window_id)
 
 
 @mcp.tool(annotations=WRITE)
 def veusz_save(path: str, document_id: str, revision: int, overwrite: bool = False,
-               request_id: str | None = None) -> dict[str, Any]:
-    """Atomically save editable .vsz under the project, setting the native save filename and dirty flag.
+               request_id: str | None = None, window_id: str | None = None) -> dict[str, Any]:
+    """Atomically save editable .vsz or .vszh5 under the project, setting native filename and dirty flag.
     Existing files require overwrite=true. Also writes a data-source manifest alongside the document.
     """
-    return invoke("save", dict(path=path, overwrite=overwrite), document_id, revision, request_id)
+    return invoke("save", dict(path=path, overwrite=overwrite), document_id, revision, request_id, window_id=window_id)
 
 
 @mcp.tool(annotations=WRITE)
 def veusz_checkpoint(document_id: str, revision: int, path: str | None = None,
-                     request_id: str | None = None) -> dict[str, Any]:
+                     request_id: str | None = None, window_id: str | None = None) -> dict[str, Any]:
     """Save a recovery .vsz without changing the working filename, dirty flag, revision or undo history."""
-    return invoke("checkpoint", {"path": path} if path else {}, document_id, revision, request_id)
+    return invoke("checkpoint", {"path": path} if path else {}, document_id, revision, request_id, window_id=window_id)
 
 
 @mcp.tool(annotations=WRITE)
-def veusz_open(path: str, document_id: str, revision: int, request_id: str | None = None) -> dict[str, Any]:
-    """Open an existing .vsz in the project through Veusz's trust checks. Refuse unsaved changes.
+def veusz_open(path: str, document_id: str, revision: int, request_id: str | None = None, window_id: str | None = None) -> dict[str, Any]:
+    """Open an existing .vsz or .vszh5 in the project through Veusz's trust checks. Refuse unsaved changes.
     Read the new document_id/revision afterwards. Never executes arbitrary supplied Python.
     """
-    return invoke("open", {"path": path}, document_id, revision, request_id)
+    return invoke("open", {"path": path}, document_id, revision, request_id, window_id=window_id)
 
 
 @mcp.tool(annotations=WRITE)
 def veusz_export(path: str, document_id: str, revision: int, page: int | None = None,
-                 dpi: int = 300, background: str = "#ffffffff", request_id: str | None = None) -> dict[str, Any]:
-    """Export current page (or explicit zero-based page) as PNG, SVG or PDF. dpi=50..1200.
+                 dpi: int = 300, background: str = "#ffffffff", request_id: str | None = None,
+                 pages: list[int] | None = None, options: dict | None = None, window_id: str | None = None) -> dict[str, Any]:
+    """Export using any available native format from veusz_file_formats. dpi=50..1200.
+    Use page (zero-based) or pages for multipage PDF/PS. options: color, antialias, quality,
+    pdfdpi, svgdpi, svgtextastext. Atomic output; a failed exporter cannot replace a good file.
     PNG defaults to opaque white. background uses #RRGGBBAA; #ffffff00 is transparent.
     """
     params = dict(path=path, dpi=dpi, background=background)
+    if pages is not None and page is not None:
+        raise ToolError("BAD_PAGE: use page or pages, not both")
+    if pages is not None:
+        params["page"] = pages
+    if options is not None:
+        params["options"] = options
     if page is not None:
         params["page"] = page
-    return invoke("export", params, document_id, revision, request_id)
+    return invoke("export", params, document_id, revision, request_id, window_id=window_id)
 
 
 @mcp.tool(annotations=WRITE, structured_output=False)
-def veusz_preview(document_id: str, revision: int) -> list:
+def veusz_preview(document_id: str, revision: int, window_id: str | None = None) -> list:
     """Return a rendered PNG as an MCP image, tagged with the document revision. Does not change settings."""
     from mcp.types import TextContent
-    result = invoke("export", {"path": "runtime/previews/%s.png" % uuid.uuid4().hex, "dpi": 110}, document_id, revision)
+    result = invoke("export", {"path": "runtime/previews/%s.png" % uuid.uuid4().hex, "dpi": 110}, document_id, revision, window_id=window_id)
     return [TextContent(type="text", text="document_id=%s revision=%s" % (document_id, revision)),
             Image(path=result["path"]).to_image_content()]
 
 
 @mcp.tool(annotations=READ)
-def veusz_operation(request_id: str) -> dict[str, Any]:
+def veusz_operation(request_id: str, window_id: str | None = None) -> dict[str, Any]:
     """Query a previous write's queued/running/done/expired state and cached response. Never re-executes it."""
-    return invoke("operation", {"request_id": request_id})
+    return invoke("operation", {"request_id": request_id}, window_id=window_id)
 
 
 if __name__ == "__main__":
